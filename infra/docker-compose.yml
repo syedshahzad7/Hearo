@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+  db:
+    image: postgres:16
+    container_name: hearo_db
+    environment:
+      POSTGRES_USER: hearo
+      POSTGRES_PASSWORD: hearo_pass
+      POSTGRES_DB: hearo
+    ports:
+      - "5432:5432"
+    volumes:
+      - hearo_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hearo -d hearo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  hearo_db_data:
