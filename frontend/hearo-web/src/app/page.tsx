@@ -32,6 +32,13 @@ export default function Home() {
             Your AI assistant for classes &amp; meetings.
           </p>
           <HealthCheck />
+
+          {/* Quick links */}
+          <div className="flex gap-3 mt-4">
+            <a className="underline" href="/signup">Sign up</a>
+            <a className="underline" href="/login">Log in</a>
+            <a className="underline" href="/dashboard">Dashboard</a>
+          </div>
         </section>
 
         <div className="flex gap-4 items-center flex-col sm:flex-row">
