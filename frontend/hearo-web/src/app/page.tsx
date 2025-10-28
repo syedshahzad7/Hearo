@@ -22,7 +22,9 @@ export default function Home() {
             </code>
             .
           </li>
-          <li className="tracking-[-.01em]">Save and see your changes instantly.</li>
+          <li className="tracking-[-.01em]">
+            Save and see your changes instantly.
+          </li>
         </ol>
 
         {/* ---- Hearo: Backend health card ---- */}
@@ -35,9 +37,22 @@ export default function Home() {
 
           {/* Quick links */}
           <div className="flex gap-3 mt-4">
-            <a className="underline" href="/signup">Sign up</a>
-            <a className="underline" href="/login">Log in</a>
-            <a className="underline" href="/dashboard">Dashboard</a>
+            <a className="underline" href="/signup">
+              Sign up
+            </a>
+            <a className="underline" href="/login">
+              Log in
+            </a>
+            <a className="underline" href="/dashboard">
+              Dashboard
+            </a>
+          </div>
+
+          {/* New session link */}
+          <div className="flex gap-3 mt-4">
+            <a className="underline" href="/sessions/new">
+              New session
+            </a>
           </div>
         </section>
 
@@ -75,7 +90,13 @@ export default function Home() {
           target="_blank"
           rel="noopener noreferrer"
         >
-          <Image aria-hidden src="/file.svg" alt="File icon" width={16} height={16} />
+          <Image
+            aria-hidden
+            src="/file.svg"
+            alt="File icon"
+            width={16}
+            height={16}
+          />
           Learn
         </a>
         <a
@@ -84,7 +105,13 @@ export default function Home() {
           target="_blank"
           rel="noopener noreferrer"
         >
-          <Image aria-hidden src="/window.svg" alt="Window icon" width={16} height={16} />
+          <Image
+            aria-hidden
+            src="/window.svg"
+            alt="Window icon"
+            width={16}
+            height={16}
+          />
           Examples
         </a>
         <a
@@ -93,7 +120,13 @@ export default function Home() {
           target="_blank"
           rel="noopener noreferrer"
         >
-          <Image aria-hidden src="/globe.svg" alt="Globe icon" width={16} height={16} />
+          <Image
+            aria-hidden
+            src="/globe.svg"
+            alt="Globe icon"
+            width={16}
+            height={16}
+          />
           Go to nextjs.org →
         </a>
       </footer>

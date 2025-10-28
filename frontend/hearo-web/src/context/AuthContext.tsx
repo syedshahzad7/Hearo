@@ -8,7 +8,8 @@ import { useRouter } from "next/navigation";
 
 type AuthState = {
   user: UserPublic | null;
-  loading: boolean;        // true while verifying
+  accessToken: string | null;                 // <-- exposed for consumers
+  loading: boolean;                           // true while verifying / logging in
   login: (email: string, password: string) => Promise<void>;
   logout: () => void;
   refreshMe: () => Promise<void>;
@@ -18,31 +19,37 @@ const AuthCtx = createContext<AuthState | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserPublic | null>(null);
+  const [accessToken, setAccessToken] = useState<string | null>(
+    typeof window !== "undefined" ? getAccessToken() : null
+  );
   const [loading, setLoading] = useState(true);
   const router = useRouter();
 
-  // Bootstrap: on mount, check token -> /me
+  // Bootstrap: on mount, if we have a token, fetch /me
   useEffect(() => {
     const init = async () => {
       try {
-        const token = getAccessToken();
-        if (!token) return;
-        const me = await fetchMe(token);
+        if (!accessToken) return;
+        const me = await fetchMe(accessToken);
         setUser(me);
       } catch {
         clearTokens();
+        setAccessToken(null);
+        setUser(null);
       } finally {
         setLoading(false);
       }
     };
     init();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // run once on mount
 
   const login = async (email: string, password: string) => {
     setLoading(true);
     try {
       const { access_token, refresh_token } = await apiLogin(email, password);
-      saveTokens(access_token, refresh_token);
+      saveTokens(access_token, refresh_token);   // persists to localStorage
+      setAccessToken(access_token);
       const me = await fetchMe(access_token);
       setUser(me);
       router.replace("/dashboard");
@@ -53,20 +60,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = () => {
     clearTokens();
+    setAccessToken(null);
     setUser(null);
     router.replace("/login");
   };
 
   const refreshMe = async () => {
-    const token = getAccessToken();
-    if (!token) throw new Error("No token");
-    const me = await fetchMe(token);
+    if (!accessToken) throw new Error("No token");
+    const me = await fetchMe(accessToken);
     setUser(me);
   };
 
   const value = useMemo(
-    () => ({ user, loading, login, logout, refreshMe }),
-    [user, loading]
+    () => ({ user, accessToken, loading, login, logout, refreshMe }),
+    [user, accessToken, loading]
   );
 
   return <AuthCtx.Provider value={value}>{children}</AuthCtx.Provider>;

@@ -2,7 +2,7 @@ from typing import List
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Repo root: C:\Hearo
+#
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 class Settings(BaseSettings):
@@ -22,10 +22,11 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60         # 1 hour
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7            # 7 days
 
+    # File uploads
+    UPLOAD_DIR: str = str(PROJECT_ROOT / "uploads")  
+
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
-
-

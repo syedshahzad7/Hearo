@@ -1,7 +1,16 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
 from sqlalchemy import String, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from uuid import uuid4
+
 from app.db.session import Base
+
+if TYPE_CHECKING:
+    from .session import Session
+
 
 class User(Base):
     __tablename__ = "users"
@@ -13,4 +22,5 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     role: Mapped[str] = mapped_column(String(32), default="student")  # "student" | "professional"
 
-    sessions: Mapped[list["MeetingSession"]] = relationship(back_populates="owner")
+    # Must match Session.owner back_populates="sessions"
+    sessions: Mapped[list["Session"]] = relationship(back_populates="owner", cascade="all,delete")
