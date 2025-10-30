@@ -1,76 +1,95 @@
 import os
-from pathlib import Path
-from typing import Annotated
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, BackgroundTasks, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select
+
 from app.db.session import get_db
 from app.core.config import Settings
 from app.auth.deps import get_current_user
 from app.models.user import User
 from app.models.session import Session
+from app.models.transcript import TranscriptChunk
+from app.services.transcribe import transcribe_session_audio
 
-settings = Settings()
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+settings = Settings()
+
 
 @router.post("", response_model=dict)
 async def create_session(
-    title: Annotated[str | None, Form()] = None,
-    role: Annotated[str, Form()] = "student",
+    title: str | None = None,
+    role: str = "student",
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    s = Session(owner_id=user.id, title=title, role=role, status="created")
+    """Create a new session record."""
+    s = Session(owner_id=current_user.id, title=title, role=role, status="created")
     db.add(s)
     await db.commit()
     await db.refresh(s)
-    return {"id": s.id, "title": s.title, "role": s.role, "status": s.status}
+    return {
+        "id": s.id,
+        "title": s.title,
+        "role": s.role,
+        "status": s.status,
+        "created_at": s.created_at,
+    }
+
 
 @router.post("/{session_id}/upload", response_model=dict)
 async def upload_audio(
     session_id: str,
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    # Ensure session exists and belongs to user
-    result = await db.execute(select(Session).where(Session.id == session_id, Session.owner_id == user.id))
-    s = result.scalar_one_or_none()
+    """Upload an audio file and trigger background transcription."""
+    # verify session ownership
+    result = await db.execute(
+        select(Session).where(Session.id == session_id, Session.owner_id == current_user.id)
+    )
+    s: Session | None = result.scalar_one_or_none()
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Save file
-    upload_dir = Path(settings.UPLOAD_DIR) / user.id / session_id
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    # keep original extension
-    ext = os.path.splitext(file.filename or "")[1].lower() or ".bin"
-    dest = upload_dir / f"audio{ext}"
+    # ensure upload directories
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    user_dir = os.path.join(settings.UPLOAD_DIR, current_user.id)
+    os.makedirs(user_dir, exist_ok=True)
 
-    # write in chunks
-    with dest.open("wb") as out:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
+    # save file
+    ext = os.path.splitext(file.filename or "")[1] or ".webm"
+    fname = f"{uuid4()}{ext}"
+    dest = os.path.join(user_dir, fname)
 
-    # update session
-    await db.execute(
-        update(Session)
-        .where(Session.id == session_id)
-        .values(audio_path=str(dest), status="uploaded")
-    )
+    with open(dest, "wb") as f:
+        f.write(await file.read())
+
+    # update DB
+    s.audio_path = dest
+    s.status = "uploaded"
     await db.commit()
 
-    return {"id": session_id, "audio_path": str(dest), "status": "uploaded"}
+    # trigger background transcription
+    background.add_task(transcribe_session_audio, db, s.id, settings)
+
+    return {"id": s.id, "audio_path": s.audio_path, "status": s.status}
+
 
 @router.get("", response_model=list[dict])
 async def list_sessions(
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(Session).where(Session.owner_id == user.id).order_by(Session.created_at.desc()))
+    """List all sessions for the current user."""
+    result = await db.execute(
+        select(Session)
+            .where(Session.owner_id == current_user.id)
+            .order_by(Session.created_at.desc())
+    )
     rows = result.scalars().all()
     return [
         {
@@ -83,3 +102,26 @@ async def list_sessions(
         }
         for r in rows
     ]
+
+
+@router.get("/{session_id}/transcript", response_model=list[dict])
+async def get_transcript(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return transcript chunks for a session owned by the current user."""
+    # Optionally ensure the session exists & belongs to user (cheap guard)
+    sess_q = await db.execute(
+        select(Session.id).where(Session.id == session_id, Session.owner_id == current_user.id)
+    )
+    if not sess_q.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result = await db.execute(
+        select(TranscriptChunk)
+            .where(TranscriptChunk.session_id == session_id)
+            .order_by(TranscriptChunk.seq.asc())
+    )
+    rows = result.scalars().all()
+    return [{"seq": r.seq, "speaker": r.speaker, "text": r.text} for r in rows]
