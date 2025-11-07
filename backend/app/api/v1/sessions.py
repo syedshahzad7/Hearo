@@ -1,7 +1,15 @@
 import os
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    UploadFile,
+    File,
+    BackgroundTasks,
+    HTTPException,
+    Form,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -11,7 +19,9 @@ from app.auth.deps import get_current_user
 from app.models.user import User
 from app.models.session import Session
 from app.models.transcript import TranscriptChunk
+from app.models.summary import Summary
 from app.services.transcribe import transcribe_session_audio
+from app.services.summarize import generate_summary
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 settings = Settings()
@@ -87,8 +97,8 @@ async def list_sessions(
     """List all sessions for the current user."""
     result = await db.execute(
         select(Session)
-            .where(Session.owner_id == current_user.id)
-            .order_by(Session.created_at.desc())
+        .where(Session.owner_id == current_user.id)
+        .order_by(Session.created_at.desc())
     )
     rows = result.scalars().all()
     return [
@@ -111,7 +121,7 @@ async def get_transcript(
     current_user: User = Depends(get_current_user),
 ):
     """Return transcript chunks for a session owned by the current user."""
-    # Optionally ensure the session exists & belongs to user (cheap guard)
+    # cheap ownership guard
     sess_q = await db.execute(
         select(Session.id).where(Session.id == session_id, Session.owner_id == current_user.id)
     )
@@ -120,8 +130,69 @@ async def get_transcript(
 
     result = await db.execute(
         select(TranscriptChunk)
-            .where(TranscriptChunk.session_id == session_id)
-            .order_by(TranscriptChunk.seq.asc())
+        .where(TranscriptChunk.session_id == session_id)
+        .order_by(TranscriptChunk.seq.asc())
     )
     rows = result.scalars().all()
     return [{"seq": r.seq, "speaker": r.speaker, "text": r.text} for r in rows]
+
+
+# -------- Phase 10: Summaries --------
+
+@router.post("/{session_id}/summarize", response_model=dict)
+async def summarize_session(
+    session_id: str,
+    style: str = Form("student"),  # "student" | "professional"
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Generate and store a summary for this session."""
+    # verify ownership
+    result = await db.execute(
+        select(Session).where(Session.id == session_id, Session.owner_id == current_user.id)
+    )
+    s = result.scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    summary = await generate_summary(db, session_id=session_id, style=style)
+    return {
+        "id": summary.id,
+        "session_id": summary.session_id,
+        "style": summary.style,
+        "content": summary.content,
+        "created_at": str(summary.created_at),
+    }
+
+
+@router.get("/{session_id}/summaries", response_model=list[dict])
+async def list_summaries(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List saved summaries for this session."""
+    # verify ownership
+    result = await db.execute(
+        select(Session).where(Session.id == session_id, Session.owner_id == current_user.id)
+    )
+    s = result.scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    q = await db.execute(
+        select(Summary)
+        .where(Summary.session_id == session_id)
+        .order_by(Summary.created_at.desc())
+    )
+    rows = q.scalars().all()
+    return [
+        {
+            "id": r.id,
+            "session_id": r.session_id,
+            "style": r.style,
+            "content": r.content,
+            "created_at": str(r.created_at),
+        }
+        for r in rows
+    ]
