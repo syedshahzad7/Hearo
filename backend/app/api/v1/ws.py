@@ -1,17 +1,17 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import JSONResponse
-from jose import jwt, JWTError
 from typing import Optional
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from jose import jwt, JWTError
+import os
 
 from app.core.config import Settings
 
 router = APIRouter()
 settings = Settings()
 
+
 def _get_user_id_from_token(token: str) -> Optional[str]:
     """
     Minimal JWT verification for WebSockets.
-    Matches your existing JWT settings (secret + algorithm).
     Returns the user id (sub) if valid, else None.
     """
     try:
@@ -28,28 +28,64 @@ def _get_user_id_from_token(token: str) -> Optional[str]:
     except JWTError:
         return None
 
+
 @router.websocket("/ws/transcribe")
 async def ws_transcribe(websocket: WebSocket):
     """
-    Placeholder WS endpoint we’ll wire to streaming STT in the next steps.
-    Auth: expects ?token=ACCESS_TOKEN in the query string (or Sec-WebSocket-Protocol in later iterations).
+    Connect with:
+      ws://127.0.0.1:8000/api/v1/ws/transcribe?session_id=...&token=ACCESS_TOKEN
+
+    The browser should send MediaRecorder binary chunks (webm/opus).
+    We append them to uploads/<user_id>/<session_id>/live_capture.webm.
     """
-    # Accept early so we can read the query params
+    # Accept first so we can read query params and start receiving frames
     await websocket.accept()
 
-    # Pull token from query (?token=...)
     token = websocket.query_params.get("token")
+    session_id = websocket.query_params.get("session_id")
     user_id = _get_user_id_from_token(token) if token else None
-    if not user_id:
-        # Close with policy violation if unauthenticated
-        await websocket.close(code=4403)  # 4403 = forbidden (custom close code)
+
+    if not user_id or not session_id:
+        # Forbidden / unauthenticated
+        await websocket.close(code=4403)
         return
 
+    # Prepare output path
+    user_dir = os.path.join(settings.UPLOAD_DIR, user_id, session_id)
+    os.makedirs(user_dir, exist_ok=True)
+    out_path = os.path.join(user_dir, "live_capture.webm")
+
+    # Open once and append as frames arrive
+    f = open(out_path, "wb")
+
     try:
-        # For now just echo back messages; we’ll replace with streaming STT next.
         while True:
-            msg = await websocket.receive_text()
-            await websocket.send_text(f"echo: {msg}")
+            message = await websocket.receive()
+
+            # Browser sends binary audio chunks
+            if "bytes" in message and message["bytes"] is not None:
+                f.write(message["bytes"])
+                f.flush()
+                continue
+
+            # Optional: handle small text control messages if you want
+            if "text" in message and message["text"] is not None:
+                # e.g., await websocket.send_text(f"ack:{message['text']}")
+                continue
+
+            # If client closed
+            if message.get("type") == "websocket.disconnect":
+                break
+
     except WebSocketDisconnect:
-        # Client disconnected — normal flow
-        return
+        # Normal client disconnect
+        pass
+    except Exception:
+        # Swallow unexpected errors to ensure file is closed
+        pass
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+        # Socket will be closed by FastAPI when we return

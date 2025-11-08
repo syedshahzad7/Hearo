@@ -1,131 +1,137 @@
-"use client";
-import React, { useEffect, useRef, useState } from "react";
-import { API_BASE } from "@/lib/api";
 
-type LiveMsg =
-  | { type: "partial"; seq: number; text: string }
-  | { type: "pong" }
-  | { type: "error"; error: string; detail?: string }
-  | { type: "closed" };
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+
+type Props = {
+  accessToken: string;
+  sessionId: string;
+  apiBase?: string; // default 127.0.0.1:8000
+};
 
 export default function LiveTranscriber({
   accessToken,
   sessionId,
-}: {
-  accessToken: string;
-  sessionId: string;
-}) {
-  const [ws, setWs] = useState<WebSocket | null>(null);
-  const [liveText, setLiveText] = useState<Array<{ seq: number; text: string }>>([]);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const [isRecording, setIsRecording] = useState(false);
+  apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000",
+}: Props) {
+  const [status, setStatus] = useState<"idle" | "recording" | "stopped">("idle");
+  const [bytesSent, setBytesSent] = useState(0);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const recRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
     return () => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-      }
+      try {
+        recRef.current?.stop();
+      } catch {}
+      try {
+        wsRef.current?.close();
+      } catch {}
+      streamRef.current?.getTracks().forEach((t) => t.stop());
     };
-  }, [ws]);
+  }, []);
 
   async function start() {
-    const url = `${API_BASE.replace("http", "ws")}/api/v1/ws/transcribe?session_id=${encodeURIComponent(
-      sessionId
-    )}&token=${encodeURIComponent(accessToken)}`;
+    setStatus("idle");
+    setBytesSent(0);
 
-    const socket = new WebSocket(url);
-    setWs(socket);
+    // 1) get mic
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    streamRef.current = stream;
 
-    socket.onmessage = (ev) => {
-      try {
-        const msg: LiveMsg = JSON.parse(ev.data);
-        if (msg.type === "partial") {
-          setLiveText((prev) => [...prev, { seq: msg.seq, text: msg.text }]);
+    // 2) open WS
+    const url = new URL("/api/v1/ws/transcribe", apiBase);
+    url.searchParams.set("session_id", sessionId);
+    url.searchParams.set("token", accessToken);
+
+    const ws = new WebSocket(url.toString().replace("http", "ws"));
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      // 3) start recorder AFTER ws is open
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
+
+      const recorder = new MediaRecorder(stream, { mimeType: mime });
+      recRef.current = recorder;
+
+      recorder.ondataavailable = async (e) => {
+        if (!e.data || e.data.size === 0) return;
+        const buf = await e.data.arrayBuffer();
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(buf); // send as binary
+          setBytesSent((v) => v + buf.byteLength);
         }
-      } catch {}
-    };
-
-    socket.onopen = async () => {
-      // mic
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-
-      mr.ondataavailable = async (e) => {
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        const blob = e.data;
-        const b64 = await blobToBase64(blob);
-        socket.send(
-          JSON.stringify({
-            type: "audio",
-            seq: Date.now(),
-            mime: blob.type || "audio/webm;codecs=opus",
-            b64,
-          })
-        );
       };
-      // send every 1000ms
-      mr.start(1000);
-      mediaRecorderRef.current = mr;
-      setIsRecording(true);
+
+      recorder.onerror = (ev) => console.error("MediaRecorder error:", ev);
+
+      // timeslice so we actually get periodic chunks
+      recorder.start(1000); // 1s
+      setStatus("recording");
     };
+
+    ws.onmessage = (ev) => {
+      // optional debug (if server sends acks/status)
+      // console.log("WS message:", ev.data);
+    };
+
+    ws.onclose = () => setStatus("stopped");
+    ws.onerror = (e) => console.error("WS error:", e);
   }
 
-  function stop() {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
+  async function stop() {
+    // stop recorder -> triggers final dataavailable with last chunk
+    const rec = recRef.current;
+    if (rec && rec.state !== "inactive") {
+      const done = new Promise<void>((resolve) => {
+        const onStop = () => {
+          rec.removeEventListener("stop", onStop);
+          resolve();
+        };
+        rec.addEventListener("stop", onStop);
+      });
+      rec.stop();
+      await done; // wait for the last chunk to be emitted & sent
     }
+
+    // tell server we’re done (after last chunk sent)
+    const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "close" }));
+      ws.send("end");
+      ws.close();
     }
-    setIsRecording(false);
+
+    // stop tracks
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    setStatus("stopped");
   }
 
   return (
-    <div className="space-y-3">
-      <div className="flex gap-2">
+    <div className="space-y-2">
+      <div className="text-sm text-gray-600">
+        Status: <b>{status}</b> • Bytes sent: <b>{bytesSent}</b>
+      </div>
+      <div className="space-x-2">
         <button
+          className="rounded-md border px-3 py-2 hover:bg-gray-50"
           onClick={start}
-          disabled={isRecording}
-          className="px-3 py-2 rounded border"
+          disabled={status === "recording"}
         >
-          {isRecording ? "Recording…" : "Start live transcription"}
+          Start live
         </button>
         <button
+          className="rounded-md border px-3 py-2 hover:bg-gray-50"
           onClick={stop}
-          disabled={!isRecording}
-          className="px-3 py-2 rounded border"
+          disabled={status !== "recording"}
         >
           Stop
         </button>
       </div>
-
-      <div className="border rounded-lg p-3 h-64 overflow-auto bg-white">
-        {liveText.length === 0 ? (
-          <p className="text-sm text-gray-500">Live transcript will appear here…</p>
-        ) : (
-          <ul className="space-y-1">
-            {liveText.map((c) => (
-              <li key={c.seq} className="text-sm">
-                {c.text}
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
     </div>
   );
-}
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve) => {
-    const r = new FileReader();
-    r.onload = () => {
-      const res = (r.result as string) || "";
-      resolve(res.split(",")[1] || ""); // remove data:...;base64,
-    };
-    r.readAsDataURL(blob);
-  });
 }
