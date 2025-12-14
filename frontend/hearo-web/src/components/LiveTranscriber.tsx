@@ -1,4 +1,4 @@
-
+// frontend/hearo-web/src/components/LiveTranscriber.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -6,16 +6,29 @@ import { useEffect, useRef, useState } from "react";
 type Props = {
   accessToken: string;
   sessionId: string;
-  apiBase?: string; // default 127.0.0.1:8000
+  apiBase?: string; // default http://127.0.0.1:8000
 };
+
+type WSMsg =
+  | { type: "ready"; session_id?: string }
+  | { type: "partial"; seq: number; text: string }
+  | { type: "pong" }
+  | { type: "done" }
+  | { type: "error"; message?: string; detail?: string };
 
 export default function LiveTranscriber({
   accessToken,
   sessionId,
   apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000",
 }: Props) {
-  const [status, setStatus] = useState<"idle" | "recording" | "stopped">("idle");
+  const [status, setStatus] = useState<
+    "idle" | "connecting" | "recording" | "stopping" | "stopped" | "error"
+  >("idle");
   const [bytesSent, setBytesSent] = useState(0);
+  const [lastServerMsg, setLastServerMsg] = useState<string>("");
+  const [partials, setPartials] = useState<Array<{ seq: number; text: string }>>(
+    []
+  );
 
   const wsRef = useRef<WebSocket | null>(null);
   const recRef = useRef<MediaRecorder | null>(null);
@@ -34,10 +47,12 @@ export default function LiveTranscriber({
   }, []);
 
   async function start() {
-    setStatus("idle");
+    setStatus("connecting");
     setBytesSent(0);
+    setLastServerMsg("");
+    setPartials([]);
 
-    // 1) get mic
+    // 1) mic permission
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     streamRef.current = stream;
 
@@ -46,12 +61,12 @@ export default function LiveTranscriber({
     url.searchParams.set("session_id", sessionId);
     url.searchParams.set("token", accessToken);
 
-    const ws = new WebSocket(url.toString().replace("http", "ws"));
+    const wsUrl = url.toString().replace(/^http/, "ws");
+    const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
     ws.onopen = () => {
-      // 3) start recorder AFTER ws is open
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
@@ -62,30 +77,77 @@ export default function LiveTranscriber({
       recorder.ondataavailable = async (e) => {
         if (!e.data || e.data.size === 0) return;
         const buf = await e.data.arrayBuffer();
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(buf); // send as binary
+
+        const sock = wsRef.current;
+        if (sock && sock.readyState === WebSocket.OPEN) {
+          sock.send(buf); // send binary chunk
           setBytesSent((v) => v + buf.byteLength);
         }
       };
 
       recorder.onerror = (ev) => console.error("MediaRecorder error:", ev);
 
-      // timeslice so we actually get periodic chunks
-      recorder.start(1000); // 1s
+      recorder.start(1000); // 1s chunks
       setStatus("recording");
     };
 
     ws.onmessage = (ev) => {
-      // optional debug (if server sends acks/status)
-      // console.log("WS message:", ev.data);
+      if (typeof ev.data !== "string") return;
+
+      try {
+        const msg = JSON.parse(ev.data) as WSMsg;
+
+        if (msg.type === "ready") {
+          setLastServerMsg("Server ready");
+          return;
+        }
+
+        if (msg.type === "partial") {
+          setPartials((prev) => [...prev, { seq: msg.seq, text: msg.text }]);
+          return;
+        }
+
+        if (msg.type === "pong") {
+          setLastServerMsg("pong");
+          return;
+        }
+
+        if (msg.type === "done") {
+          setLastServerMsg("done");
+          // NOW it’s safe to close (server finished transcription + sends final)
+          try {
+            wsRef.current?.close();
+          } catch {}
+          setStatus("stopped");
+          return;
+        }
+
+        if (msg.type === "error") {
+          setLastServerMsg(
+            `error: ${msg.message || ""} ${msg.detail ? `(${msg.detail})` : ""}`
+          );
+          setStatus("error");
+        }
+      } catch {
+        // ignore malformed JSON
+      }
     };
 
-    ws.onclose = () => setStatus("stopped");
-    ws.onerror = (e) => console.error("WS error:", e);
+    ws.onclose = () => {
+      // If we closed intentionally after "done", status is already set
+      setStatus((s) => (s === "recording" || s === "connecting" ? "stopped" : s));
+    };
+
+    ws.onerror = (e) => {
+      console.error("WS error:", e);
+      setStatus("error");
+    };
   }
 
   async function stop() {
-    // stop recorder -> triggers final dataavailable with last chunk
+    setStatus("stopping");
+
+    // 1) stop recorder and wait for last chunk to flush
     const rec = recRef.current;
     if (rec && rec.state !== "inactive") {
       const done = new Promise<void>((resolve) => {
@@ -96,33 +158,42 @@ export default function LiveTranscriber({
         rec.addEventListener("stop", onStop);
       });
       rec.stop();
-      await done; // wait for the last chunk to be emitted & sent
+      await done;
     }
 
-    // tell server we’re done (after last chunk sent)
+    // 2) stop mic tracks (we are done capturing audio)
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+
+    // 3) IMPORTANT: do NOT close WS here.
+    // Send "end" and WAIT for server to respond with {type:"done"}
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send("end");
-      ws.close();
+      setLastServerMsg("sent end; waiting for done…");
+    } else {
+      setStatus("stopped");
     }
-
-    // stop tracks
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    setStatus("stopped");
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       <div className="text-sm text-gray-600">
         Status: <b>{status}</b> • Bytes sent: <b>{bytesSent}</b>
+        {lastServerMsg ? (
+          <>
+            {" "}
+            • Server: <b>{lastServerMsg}</b>
+          </>
+        ) : null}
       </div>
+
       <div className="space-x-2">
         <button
           className="rounded-md border px-3 py-2 hover:bg-gray-50"
           onClick={start}
-          disabled={status === "recording"}
+          disabled={status === "recording" || status === "connecting" || status === "stopping"}
         >
-          Start live
+          {status === "connecting" ? "Connecting..." : "Start live"}
         </button>
         <button
           className="rounded-md border px-3 py-2 hover:bg-gray-50"
@@ -131,6 +202,22 @@ export default function LiveTranscriber({
         >
           Stop
         </button>
+      </div>
+
+      <div className="border rounded-lg p-3 h-64 overflow-auto bg-white">
+        {partials.length === 0 ? (
+          <p className="text-sm text-gray-500">
+            Live transcript will appear here…
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {partials.map((p) => (
+              <li key={p.seq} className="text-sm">
+                {p.text}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );
